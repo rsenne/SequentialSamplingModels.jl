@@ -68,19 +68,30 @@ end
 # Wabersich & Vandekerckhove (2014) #
 #####################################
 
-function pdf(d::DDM{T}, choice, rt; ϵ::Real = 1.0e-12) where {T <: Real}
-    @argcheck d.τ < rt
+"""
+    logpdf(d::DDM, choice, rt; ϵ = 1.0e-12)
+
+Log density of `rt` at the boundary given by `choice` (1 = upper, 2 = lower). The density is
+computed directly in log space; returns `-Inf` outside the support (`rt ≤ τ`, infinite `rt`,
+or an invalid `choice`) rather than throwing, so it can be used safely inside samplers.
+"""
+function logpdf(d::DDM{T}, choice, rt; ϵ::Real = 1.0e-12) where {T <: Real}
+    (ν, α, z, τ) = params(d)
+    LT = typeof(float(zero(promote_type(T, typeof(rt)))))
+    ((choice ≠ 1) && (choice ≠ 2)) && return LT(-Inf)
+    ((rt ≤ τ) || isinf(rt)) && return LT(-Inf)
     if choice == 1
-        (ν, α, z, τ) = params(d)
-        return _pdf(DDM(-ν, α, 1 - z, τ), rt; ϵ)
+        return _logpdf_lower(-ν, α, 1 - z, τ, rt; ϵ)
     end
-    return _pdf(d, rt; ϵ)
+    return _logpdf_lower(ν, α, z, τ, rt; ϵ)
 end
 
-# probability density function over the lower boundary
-function _pdf(d::DDM, t::Real; ϵ::Real = 1.0e-12)
-    (ν, α, z, τ) = params(d)
-    u = (t - τ) / α^2 #use normalized time
+pdf(d::DDM, choice, rt; ϵ::Real = 1.0e-12) = exp(logpdf(d, choice, rt; ϵ))
+
+# log probability density function over the lower boundary
+function _logpdf_lower(ν, α, z, τ, t; ϵ::Real = 1.0e-12)
+    Δt = t - τ
+    u = Δt / α^2 #use normalized time
 
     K_s = 2.0
     K_l = 1 / (π * sqrt(u))
@@ -93,39 +104,44 @@ function _pdf(d::DDM, t::Real; ϵ::Real = 1.0e-12)
         K_s = max(2 + sqrt(-2u * log(2ϵ * sqrt(2 * π * u))), sqrt(u) + 1)
     end
 
-    p = exp((-α * z * ν) - (0.5 * (ν^2) * (t - τ))) / (α^2)
+    log_p = -α * z * ν - 0.5 * ν^2 * Δt - 2 * log(α)
 
     # decision rule for infinite sum algorithm
     if K_s < K_l
-        return p * _small_time_pdf(u, z, ceil(Int, K_s))
+        return log_p + _log_small_time_pdf(u, z, ceil(Int, K_s))
     end
-    return p * _large_time_pdf(u, z, ceil(Int, K_l))
+    log_large = _log_large_time_pdf(u, z, ceil(Int, K_l))
+    # truncated large-time series can be non-positive; fall back to small-time series
+    isfinite(log_large) && return log_p + log_large
+    return log_p + _log_small_time_pdf(u, z, ceil(Int, K_s))
 end
 
-# small-time expansion
-function _small_time_pdf(u::T, z::T, K::Int) where {T <: Real}
-    inf_sum = zero(T)
-
-    k_series = (-floor(Int, 0.5 * (K - 1))):ceil(Int, 0.5 * (K - 1))
-    for k ∈ k_series
-        inf_sum += ((2k + z) * exp(-((2k + z)^2 / (2u))))
+# log of the small-time expansion. The k = 0 term has the largest exponent (-z²/2u),
+# so it is factored out of the sum to avoid underflow at small u.
+function _log_small_time_pdf(u, z, K::Int)
+    # ((2k + z)² - z²) / 2u = 2k(k + z) / u ≥ 0
+    term(k) = (2k + z) * exp(-2k * (k + z) / u)
+    inf_sum = zero(promote_type(typeof(u), typeof(z)))
+    # sum symmetric ±k pairs from smallest to largest so that they cancel exactly when z = 0.
+    # This uses at least as many terms as the K terms required by the error bound.
+    for k ∈ ceil(Int, 0.5 * (K - 1)):-1:1
+        inf_sum += term(k) + term(-k)
     end
-
-    return inf_sum / sqrt(2π * u^3)
+    inf_sum += z
+    inf_sum ≤ 0 && return oftype(inf_sum, -Inf)
+    return -z^2 / (2u) + log(inf_sum) - 0.5 * log(2π) - 1.5 * log(u)
 end
 
-# large-time expansion
-function _large_time_pdf(u::T, z::T, K::Int) where {T <: Real}
-    inf_sum = zero(T)
-
+# log of the large-time expansion. The k = 1 term has the largest exponent (-π²u/2),
+# so it is factored out of the sum to avoid underflow at large u.
+function _log_large_time_pdf(u, z, K::Int)
+    inf_sum = zero(promote_type(typeof(u), typeof(z)))
     for k ∈ 1:K
-        inf_sum += (k * exp(-0.5 * (k^2 * π^2 * u)) * sin(k * π * z))
+        inf_sum += k * exp(-0.5 * (k^2 - 1) * π^2 * u) * sin(k * π * z)
     end
-
-    return π * inf_sum
+    inf_sum ≤ 0 && return oftype(inf_sum, -Inf)
+    return log(π) - 0.5 * π^2 * u + log(inf_sum)
 end
-
-logpdf(d::DDM, choice, rt; ϵ::Real = 1.0e-12) = log(pdf(d, choice, rt; ϵ))
 
 logpdf(d::DDM, data::Tuple) = logpdf(d, data...)
 
@@ -135,7 +151,7 @@ logpdf(d::DDM, data::Tuple) = logpdf(d, data...)
 #########################################
 
 function cdf(d::DDM{T}, choice::Int, rt::Real = 10; ϵ::Real = 1.0e-12) where {T <: Real}
-    @argcheck d.τ < rt
+    rt ≤ d.τ && return zero(float(promote_type(T, typeof(rt))))
     if choice == 1
         (ν, α, z, τ) = params(d)
         return _cdf(DDM(-ν, α, 1 - z, τ), rt; ϵ)
